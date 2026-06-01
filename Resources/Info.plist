@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>Squirrel</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.charliewillis.squirrel</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Squirrel</string>
+    <key>CFBundleDisplayName</key>
+    <string>Squirrel</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Squirrel records your ideas with your microphone so they can be transcribed into your forest.md.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Squirrel uses Apple Events to detect which editor or IDE is frontmost so it can save ideas to the right project's forest.md.</string>
+</dict>
+</plist>
