@@ -95,8 +95,14 @@ public struct ForestStore: Sendable {
                 if let prev = pendingHeading {
                     output.append(prev)
                     pendingHeading = nil
-                    skipping = false
                 }
+                // A new entry starts here, so stop discarding the previous one.
+                // Critical: when the entry we just deleted was the target, its
+                // heading was nil'd on match (so the flush above is a no-op) — if we
+                // didn't reset skipping here we'd keep discarding into THIS following
+                // entry, eating its metadata + body and leaving its heading orphaned
+                // (an entry with no timestamp, which then can't be deleted at all).
+                skipping = false
                 pendingHeading = line
                 i += 1
                 // Look ahead for the metadata line within the next few lines (skip blanks).

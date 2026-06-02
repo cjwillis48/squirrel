@@ -41,36 +41,89 @@ struct SquirrelHook {
         let store = ForestStore(forestPath: config.forestPath)
         let allEntries = (try? store.entries()) ?? []
 
-        // Untagged-for-any-project, captured since this session started, and not
-        // yet nudged about. Once a capture has been surfaced to the model once,
-        // it stays out of the hook payload for the remainder of this session —
-        // the ack line in conversation history is the index entry; everything
-        // beyond that is bloat.
+        // Two tiers, both drawn from forest entries untagged for any project:
+        //
+        //  FRESH  — captured since this session started and not yet acked. The
+        //           model MUST confirm these once (a stash you can't see landing
+        //           breaks trust). Marked nudged after, so they never re-ack.
+        //  PARKED — everything else still untagged (older than this session, or
+        //           already acked this session). NOT shown by default. Provided to
+        //           the model as candidates; surfaced only when one is genuinely
+        //           relevant to the current turn, flagged `[likely relevant]`.
+        //           Never marked nudged — relevance-gated re-surfacing isn't
+        //           pestering, and tagging/nesting an item drops it from the pool.
         let nudged = nest.nudgedCaptureIDs()
-        let inSession = allEntries.filter { entry in
-            guard entry.projectSlugs.isEmpty else { return false }
+        let untagged = allEntries.filter { $0.projectSlugs.isEmpty }
+        let fresh = untagged.filter { entry in
             guard let ts = entry.timestamp, ts > sessionStart else { return false }
             if let tsString = entry.timestampString, nudged.contains(tsString) { return false }
             return true
         }
+        let freshIDs = Set(fresh.compactMap { $0.timestampString })
+        // `allEntries` is most-recent-first, so prefix() keeps the freshest parked.
+        let parked = untagged
+            .filter { entry in
+                guard let id = entry.timestampString else { return false }
+                return !freshIDs.contains(id)
+            }
+            .prefix(6)
 
-        if inSession.isEmpty { return }
+        if fresh.isEmpty && parked.isEmpty { return }
 
         var lines: [String] = []
-        lines.append("[Squirrel] The user just stashed the items below. Start your reply with one `[Stashed: <title>]` line per item — nothing more on those lines, no commentary — then continue with the user's actual request. Don't expand or discuss the captures unless the user does.")
-        lines.append("")
-        lines.append("New captures:")
-        for entry in inSession.prefix(10) {
-            let id = entry.timestampString.map { "`\($0)`" } ?? "?"
-            lines.append("  • \(entry.title)  (\(id))")
+        lines.append(Self.instruction)
+        if !fresh.isEmpty {
+            lines.append("")
+            lines.append("NEW captures (always confirm these):")
+            for entry in fresh.prefix(10) {
+                let id = entry.timestampString.map { "`\($0)`" } ?? "?"
+                lines.append("  • \(entry.title)  (\(id))")
+            }
+            if fresh.count > 10 { lines.append("  • (+\(fresh.count - 10) more)") }
         }
-        if inSession.count > 10 { lines.append("  • (+\(inSession.count - 10) more)") }
+        if !parked.isEmpty {
+            lines.append("")
+            lines.append("PARKED ideas (untriaged — surface ONLY if clearly relevant to this turn):")
+            for entry in parked {
+                let id = entry.timestampString.map { "`\($0)`" } ?? "?"
+                lines.append("  • \(entry.title)  (\(id))")
+            }
+        }
         print(lines.joined(separator: "\n"))
 
-        // Optimistically mark these as nudged. Worst case: the model never
-        // emits an ack and the user loses one visible bracket line — the
-        // capture is still in the forest, retrievable via find_in_forest.
-        let toMark = inSession.compactMap { $0.timestampString }
+        // One-shot only for FRESH. Parked items are deliberately left unmarked so
+        // they can resurface on a later, genuinely-relevant turn.
+        let toMark = fresh.compactMap { $0.timestampString }
         try? nest.markNudged(toMark)
     }
+
+    /// The behavioral spec handed to the model. Not shown to the user — it tells
+    /// the model how to render the Squirrel block. Backticks are intentional: the
+    /// user's terminal theme tints inline code, so the markers render in colour.
+    static let instruction = """
+    [Squirrel] Below are the user's parked ideas. Answer the user's actual request FIRST, then \
+    render a Squirrel block as the VERY LAST thing in your reply — nothing after it. The block is a \
+    markdown blockquote so it renders set-apart from your own answer. A long answer with tool use \
+    buries anything at the top, so this goes at the bottom on purpose.
+
+    Render it EXACTLY like this, keeping the backticks (they colour the markers in the user's theme):
+
+    > `[🐿️ Squirrel]` — captured while we talked:
+    > 1. <new capture title>
+    > 2. <new capture title>
+    >
+    > Want any recorded for this project? Just say which (e.g. "1 and 3").
+
+    Rules:
+    - Pick the intro line to match what's shown: "captured while we talked:" when there are new \
+    captures; "possibly relevant to this:" when the block is ONLY a relevant parked idea.
+    - Number every shown item in one list so "nest 1 and 3" maps cleanly.
+    - NEW captures are listed unconditionally — one numbered line each, title only, no commentary.
+    - PARKED ideas are hidden BY DEFAULT. Include a parked idea ONLY if it is clearly relevant to \
+    what the user is asking or doing THIS turn. When you do, mark it: `[likely relevant]` <title> — \
+    <≤8 words on why it fits>. If unsure, leave it out — a false "relevant" erodes trust faster than \
+    a miss. If none are relevant, show nothing about parked ideas (and if there are also no new \
+    captures, output NO block at all).
+    - Stay inside the blockquote. Don't expand or discuss the ideas unless the user does.
+    """
 }
