@@ -29,15 +29,21 @@ public struct AnthropicService: Sendable {
         /// True when Claude classified the transcript as a Whisper hallucination
         /// rather than real user speech. Caller should treat as empty capture.
         public var discard: Bool
+        /// A project the speaker *explicitly* named as the home for this idea,
+        /// copied verbatim from the `knownProjects` list. nil unless there was a
+        /// confident, explicit mention — the caller still validates against the
+        /// registry before tagging (a mis-tag is worse than leaving it untagged).
+        public var project: String?
 
-        public init(title: String, bullets: [String], discard: Bool = false) {
+        public init(title: String, bullets: [String], discard: Bool = false, project: String? = nil) {
             self.title = title
             self.bullets = bullets
             self.discard = discard
+            self.project = project
         }
     }
 
-    public func summarize(transcript: String) async throws -> Summary {
+    public func summarize(transcript: String, knownProjects: [String] = []) async throws -> Summary {
         guard let apiKey, !apiKey.isEmpty else { throw AnthropicError.missingKey }
 
         let endpoint = URL(string: "https://api.anthropic.com/v1/messages")!
@@ -46,6 +52,19 @@ public struct AnthropicService: Sendable {
         request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let projectClause: String
+        if knownProjects.isEmpty {
+            projectClause = ""
+        } else {
+            let list = knownProjects.map { "\"\($0)\"" }.joined(separator: ", ")
+            projectClause = """
+
+
+            Project routing (optional field): the speaker may name a project this idea belongs to. Known projects: [\(list)].
+            ONLY if the speaker EXPLICITLY names one of these as the home for the idea (e.g. "in crp-backend, we should…", "for the squirrel app…"), add a "project" field whose value is copied EXACTLY from the list. The speaker may say it loosely (no hyphens, different casing) — match generously, but output the exact list spelling. If they don't clearly name one of these projects, OMIT the project field. Never invent a project that isn't in the list. When unsure, omit — a wrong project is worse than none.
+            """
+        }
 
         let systemPrompt = """
         You turn a raw voice memo of an idea into a tight written entry for a personal "parking lot" markdown file.
@@ -57,7 +76,7 @@ public struct AnthropicService: Sendable {
         {"discard": true}
         Don't second-guess obvious idea content; only discard when the transcript reads like model-generated filler.
 
-        Be faithful to the speaker. Don't add ideas they didn't express. If the transcript is very short, return one bullet.
+        Be faithful to the speaker. Don't add ideas they didn't express. If the transcript is very short, return one bullet.\(projectClause)
         """
 
         let payload: [String: Any] = [
@@ -102,6 +121,7 @@ public struct AnthropicService: Sendable {
             let title: String?
             let bullets: [String]?
             let discard: Bool?
+            let project: String?
         }
 
         if let data = stripped.data(using: .utf8),
@@ -110,7 +130,7 @@ public struct AnthropicService: Sendable {
                 return Summary(title: "", bullets: [], discard: true)
             }
             if let title = parsed.title, let bullets = parsed.bullets {
-                return Summary(title: title, bullets: bullets)
+                return Summary(title: title, bullets: bullets, project: parsed.project)
             }
         }
 

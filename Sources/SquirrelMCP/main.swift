@@ -112,7 +112,8 @@ actor MCPServer {
         let normalized = (cwd as NSString).standardizingPath
         let autoInitBlocklist: Set<String> = [NSHomeDirectory(), "/", "/tmp", "/private/tmp"]
         if !autoInitBlocklist.contains(normalized) {
-            if let project = try? ProjectRegistry.register(path: cwd) {
+            let registered = try? ProjectRegistry.register(path: cwd)
+            if let project = registered {
                 log("registered project: \(project.name) at \(project.path)")
             }
             let nest = NestStore(projectRoot: cwd)
@@ -129,8 +130,31 @@ actor MCPServer {
             } catch {
                 log("could not update CLAUDE.md: \(error.localizedDescription)")
             }
-            // Rebuild INDEX.md on every session start so any frontmatter edits made
-            // between sessions (priority changes, status flips) get picked up.
+            // Reconcile forest → nest: materialize a nest file for every forest
+            // entry tagged with this project that doesn't have one yet. This is
+            // what makes tag-at-capture (and the app's assign dropdown, which
+            // writes the forest tag but not the nest file) actually land in the
+            // project. Create-only — NestStore.nest() skips files that already
+            // exist, so it never clobbers a nest file you've edited.
+            if let project = registered {
+                let slug = ForestStore.projectTagSlug(project.name)
+                let store = ForestStore(forestPath: Configuration.load().forestPath)
+                if let entries = try? store.entries() {
+                    var created = 0
+                    for entry in entries where entry.projectSlugs.contains(slug) {
+                        let title = nest.slug(forTitle: entry.title)
+                        let existed = FileManager.default.fileExists(
+                            atPath: nest.nestFolder.appendingPathComponent("\(title).md").path
+                        )
+                        if (try? nest.nest(entry: entry)) != nil, !existed { created += 1 }
+                    }
+                    if created > 0 {
+                        log("reconciled \(created) tagged entr\(created == 1 ? "y" : "ies") into nest")
+                    }
+                }
+            }
+            // Rebuild INDEX.md on every session start so reconciled entries and any
+            // frontmatter edits made between sessions (priority, status) get picked up.
             do {
                 try nest.regenerateIndex()
             } catch {

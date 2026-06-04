@@ -33,15 +33,24 @@ public struct CaptureService: Sendable {
         var title = Self.fallbackTitle(from: trimmed)
         var bullets: [String] = []
         var summarized = false
+        // An explicit `project` argument always wins; otherwise we let the
+        // summarizer detect an explicitly-mentioned project (high precision only).
+        var resolvedProject = project
 
         if summarizeWithClaude, let key = anthropicKey, !key.isEmpty {
             let anthropic = AnthropicService(apiKey: key, model: claudeModel)
+            // Only ask the model to detect a project when the caller didn't supply
+            // one. Pass the registered names so it can only pick a real project.
+            let knownProjects = project == nil ? ProjectRegistry.all().map(\.name) : []
             do {
-                let summary = try await anthropic.summarize(transcript: trimmed)
+                let summary = try await anthropic.summarize(transcript: trimmed, knownProjects: knownProjects)
                 if summary.discard { return .empty }
                 title = Self.clampTitle(summary.title)
                 bullets = summary.bullets
                 summarized = true
+                if resolvedProject == nil, let detected = summary.project {
+                    resolvedProject = Self.validateProject(detected)
+                }
             } catch {
                 // Non-fatal — fall through with the word-boundary fallback title.
             }
@@ -53,12 +62,48 @@ public struct CaptureService: Sendable {
             bullets: bullets,
             forestPath: forestPath,
             durationSeconds: durationSeconds,
-            project: project
+            project: resolvedProject
         )
 
         let store = ForestStore(forestPath: forestPath)
         try store.append(idea: idea)
+
+        // When WE detected the project (the caller passed none and the summarizer
+        // matched a mention), materialize the nest file now — atomically with the
+        // tag — instead of leaving it for the next MCP-startup reconciliation. This
+        // closes the "tagged but not nested" window for app captures. Only when
+        // detected: callers that pass `project` explicitly (e.g. the MCP stash tool)
+        // own their own nesting and honor their own nest/no-nest flag.
+        // Best-effort — a nest failure must not fail the capture; the forest tag is
+        // the source of truth and reconciliation backstops it on the next startup.
+        let didDetectProject = project == nil
+        if didDetectProject, let detected = resolvedProject,
+           let root = ProjectRegistry.find(byName: detected)?.path {
+            let isoTimestamp: String = {
+                let f = ISO8601DateFormatter()
+                f.formatOptions = [.withInternetDateTime]
+                return f.string(from: idea.createdAt)
+            }()
+            if let entry = (try? store.entries())?.first(where: { $0.timestampString == isoTimestamp }) {
+                _ = try? NestStore(projectRoot: root).nest(entry: entry)
+            }
+        }
+
         return .captured(idea, summarized: summarized)
+    }
+
+    /// Defense-in-depth for summarizer-detected projects: only accept a detection
+    /// that resolves to a registered project, and return the canonical registry
+    /// spelling. Matching is on the *tag slug* (via `ForestStore.projectTagSlug`,
+    /// the same normalization used to write tags), so spoken/voice variants like
+    /// "CRP backend" or "crp backend" resolve to "crp-backend". Strict on identity
+    /// (must be a real registered project — no inventing), forgiving on formatting.
+    /// Anything that doesn't resolve is dropped: the idea stays untagged, which is
+    /// the safe failure (a mis-tag hides the idea in the wrong project's nest).
+    static func validateProject(_ detected: String) -> String? {
+        let needle = ForestStore.projectTagSlug(detected)
+        guard !needle.isEmpty else { return nil }
+        return ProjectRegistry.all().first { ForestStore.projectTagSlug($0.name) == needle }?.name
     }
 
     /// Title used when Claude summarization is off or unavailable. First few words
