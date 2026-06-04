@@ -14,12 +14,17 @@ final class AppState: ObservableObject {
     @Published var hasOpenAIKey: Bool = false
     @Published var hasAnthropicKey: Bool = false
     @Published var micAuthorization: AVAuthorizationStatus = .notDetermined
+    /// Count of forest entries not yet tagged to any project. Drives the menu-bar
+    /// badge and the "ideas to triage" row — the ambient pull signal that replaced
+    /// the per-message capture nudge.
+    @Published var untaggedCount: Int = 0
 
     let preferences = Preferences.shared
 
     private let hotkeyManager = HotkeyManager()
     private let recorder = AudioRecorder()
     private var prefsCancellables = Set<AnyCancellable>()
+    private var forestWatcher: ForestWatcher?
 
     private init() {
         refreshKeyState()
@@ -58,6 +63,28 @@ final class AppState: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.restartHotkeys() }
             .store(in: &prefsCancellables)
+
+        // Keep the untagged badge live: recompute now, and again whenever the
+        // forest file changes on disk (our own captures, /stash, /scan-forest).
+        refreshUntaggedCount()
+        startForestWatcher()
+    }
+
+    private func startForestWatcher() {
+        forestWatcher = ForestWatcher(path: preferences.forestPath) { [weak self] in
+            Task { @MainActor in self?.refreshUntaggedCount() }
+        }
+    }
+
+    /// Recompute the untagged-idea count off the main thread (forest read is file
+    /// IO) and publish on main. Cheap — forest.md is small.
+    func refreshUntaggedCount() {
+        let path = preferences.forestPath
+        Task.detached {
+            let store = ForestStore(forestPath: path)
+            let count = ((try? store.entries()) ?? []).filter { $0.projectSlugs.isEmpty }.count
+            await MainActor.run { AppState.shared.untaggedCount = count }
+        }
     }
 
     private func restartHotkeys() {
@@ -70,6 +97,8 @@ final class AppState: ObservableObject {
 
     func stop() {
         hotkeyManager.stop()
+        forestWatcher?.stop()
+        forestWatcher = nil
         if recorder.isRecording {
             _ = try? recorder.stop()
         }
@@ -214,6 +243,10 @@ final class AppState: ObservableObject {
                 recentIdeas.insert(idea, at: 0)
                 if recentIdeas.count > 10 { recentIdeas.removeLast(recentIdeas.count - 10) }
                 recordingState = .idle
+                // Deterministic, app-owned confirmation that the capture landed —
+                // this replaces the old model-rendered acknowledgment block.
+                CaptureToastController.shared.show(title: idea.title)
+                refreshUntaggedCount()
             }
         } catch {
             recordingState = .error(describe(error))

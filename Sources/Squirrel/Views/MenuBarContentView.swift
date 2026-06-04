@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import SwiftUI
 import SquirrelCore
@@ -5,6 +6,9 @@ import SquirrelCore
 struct MenuBarContentView: View {
     @EnvironmentObject private var state: AppState
     @Environment(\.openSettings) private var openSettings
+    /// The window hosting this MenuBarExtra popover. `.menuBarExtraStyle(.window)`
+    /// doesn't auto-dismiss when we open another window, so we close it ourselves.
+    @State private var hostWindow: NSWindow?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -15,6 +19,10 @@ struct MenuBarContentView: View {
             }
             Divider()
             recordButton
+            if state.untaggedCount > 0 {
+                Divider()
+                triageRow
+            }
             Divider()
             targetSection
             if !state.recentIdeas.isEmpty {
@@ -33,7 +41,16 @@ struct MenuBarContentView: View {
         }
         .padding(14)
         .frame(width: 320)
-        .onAppear { state.refreshMicAuthorization() }
+        .background(WindowAccessor { hostWindow = $0 })
+        .onAppear {
+            state.refreshMicAuthorization()
+            state.refreshUntaggedCount()
+        }
+    }
+
+    /// Close the menu-bar popover. It reopens cleanly on the next icon click.
+    private func dismissMenu() {
+        hostWindow?.close()
     }
 
     @ViewBuilder
@@ -95,6 +112,7 @@ struct MenuBarContentView: View {
             .disabled(state.recordingState.isBusy && state.recordingState != .recording)
 
             Button {
+                dismissMenu()
                 state.openTextEntryWindow()
             } label: {
                 HStack {
@@ -109,6 +127,26 @@ struct MenuBarContentView: View {
             .buttonStyle(.bordered)
             .controlSize(.large)
         }
+    }
+
+    private var triageRow: some View {
+        Button {
+            dismissMenu()
+            state.openParkingLot()
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "tray.full")
+                    .foregroundStyle(.orange)
+                Text("\(state.untaggedCount) idea\(state.untaggedCount == 1 ? "" : "s") to triage")
+                    .font(.callout)
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .buttonStyle(.plain)
+        .help("Open the forest to tag these to a project")
     }
 
     private var targetSection: some View {
@@ -152,6 +190,7 @@ struct MenuBarContentView: View {
     private var footerButtons: some View {
         HStack {
             Button("Browse forest…") {
+                dismissMenu()
                 state.openParkingLot()
             }
             Spacer()
@@ -160,6 +199,7 @@ struct MenuBarContentView: View {
             // the SwiftUI environment is the macOS 14+ blessed API and handles
             // activation correctly.
             Button("Settings…") {
+                dismissMenu()
                 NSApp.activate(ignoringOtherApps: true)
                 openSettings()
             }
@@ -174,5 +214,22 @@ struct MenuBarContentView: View {
     private var displayForestPath: String {
         state.preferences.forestPath
             .replacingOccurrences(of: NSHomeDirectory(), with: "~")
+    }
+}
+
+/// Bridges to the AppKit `NSWindow` hosting a SwiftUI view, so we can close the
+/// MenuBarExtra popover programmatically. The view is invisible (zero-size) and
+/// reports its window once it's attached.
+private struct WindowAccessor: NSViewRepresentable {
+    let onResolve: (NSWindow?) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async { onResolve(view.window) }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async { onResolve(nsView.window) }
     }
 }

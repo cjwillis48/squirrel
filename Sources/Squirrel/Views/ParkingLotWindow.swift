@@ -52,6 +52,7 @@ struct ParkingLotView: View {
     @State private var filterProject: String? = nil
     @State private var searchText: String = ""
     @State private var lastError: String?
+    @State private var showingManageProjects = false
 
     var body: some View {
         HSplitView {
@@ -63,6 +64,9 @@ struct ParkingLotView: View {
         .frame(minWidth: 760, minHeight: 480)
         .toolbar { toolbar }
         .onAppear(perform: reload)
+        .sheet(isPresented: $showingManageProjects) {
+            ManageProjectsView(projects: projects) { reload() }
+        }
     }
 
     @ToolbarContentBuilder
@@ -95,6 +99,14 @@ struct ParkingLotView: View {
                 Image(systemName: "doc.text")
             }
             .help("Open forest.md")
+        }
+        ToolbarItem(placement: .primaryAction) {
+            Button {
+                showingManageProjects = true
+            } label: {
+                Image(systemName: "folder.badge.gearshape")
+            }
+            .help("Manage the project list")
         }
     }
 
@@ -366,5 +378,91 @@ private struct EntryDetailView: View {
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
         return formatter.string(from: date)
+    }
+}
+
+/// Prune the project list. Projects are auto-registered every time Claude Code
+/// opens in a directory, so the list accumulates throwaway dirs; this lets the
+/// user forget them. Removing a project only drops it from the picker — entries
+/// already tagged with it keep their tag.
+private struct ManageProjectsView: View {
+    let projects: [Project]
+    let onChange: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var rows: [Project]
+
+    init(projects: [Project], onChange: @escaping () -> Void) {
+        self.projects = projects
+        self.onChange = onChange
+        _rows = State(initialValue: projects)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Manage projects")
+                    .font(.headline)
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(16)
+
+            Divider()
+
+            if rows.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "folder")
+                        .imageScale(.large)
+                        .foregroundStyle(.secondary)
+                    Text("No projects registered")
+                        .foregroundStyle(.secondary)
+                    Text("They appear automatically when you open Claude Code in a repo.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, minHeight: 160)
+                .padding()
+            } else {
+                List {
+                    ForEach(rows) { project in
+                        HStack(spacing: 8) {
+                            Image(systemName: "folder.fill").foregroundStyle(.tint)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(project.name)
+                                Text(project.path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            Spacer()
+                            Button(role: .destructive) {
+                                remove(project)
+                            } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Forget this project")
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+                .listStyle(.inset)
+                .frame(minHeight: 240)
+            }
+        }
+        .frame(width: 460, height: 360)
+    }
+
+    private func remove(_ project: Project) {
+        do {
+            try ProjectRegistry.remove(path: project.path)
+            rows.removeAll { $0.id == project.id }
+            onChange()
+        } catch {
+            NSSound.beep()
+        }
     }
 }
