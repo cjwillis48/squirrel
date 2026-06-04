@@ -11,7 +11,6 @@ let package = Package(
         // The .app bundle still exposes the menu-bar binary as `Squirrel`;
         // see build-app.sh.
         .executable(name: "SquirrelMenuBar", targets: ["Squirrel"]),
-        .executable(name: "squirrel-hook", targets: ["SquirrelHook"]),
         .executable(name: "squirrel-mcp", targets: ["SquirrelMCP"])
     ],
     targets: [
@@ -23,11 +22,6 @@ let package = Package(
             name: "Squirrel",
             dependencies: ["SquirrelCore"],
             path: "Sources/Squirrel"
-        ),
-        .executableTarget(
-            name: "SquirrelHook",
-            dependencies: ["SquirrelCore"],
-            path: "Sources/SquirrelHook"
         ),
         .executableTarget(
             name: "SquirrelMCP",
