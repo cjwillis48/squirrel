@@ -8,6 +8,8 @@ build/
 # Machine-local state, not shared across machines
 .claude/squirrel-state.json
 .claude/settings.local.json
+# (The nest under .claude/nest/ is ignored by its own .claude/nest/.gitignore,
+#  which Squirrel seeds on first run — a personal parking lot, not a backlog.)
 
 # macOS cruft
 .DS_Store

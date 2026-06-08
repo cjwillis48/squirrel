@@ -1,0 +1,5 @@
+# Squirrel nest: a personal "don't forget this while I'm in here" parking lot,
+# regenerated locally every session — not a shared backlog. Ignored on purpose.
+# Delete this file if you'd rather commit the nest as a shared project backlog.
+*
+!.gitignore

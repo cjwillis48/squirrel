@@ -38,15 +38,21 @@ struct SquirrelMCP {
         ps.standardOutput = pipe
         ps.standardError = Pipe()
 
+        let output: String
         do {
             try ps.run()
+            // Drain stdout BEFORE waiting. `ps -A` output exceeds the ~64KB pipe
+            // buffer on a busy machine; if we wait first, ps blocks on write while
+            // we never read — a deadlock that hangs squirrel-mcp before it reads a
+            // single stdin byte, surfacing as a 30s MCP connection timeout. Reading
+            // to EOF returns when ps closes its stdout (i.e. exits), so the
+            // subsequent waitUntilExit() just reaps the already-finished process.
+            output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
             ps.waitUntilExit()
         } catch {
             // ps failed; bail silently — we'll let macOS sort it out the hard way.
             return
         }
-
-        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         for line in output.split(separator: "\n") {
             let cols = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
             guard cols.count >= 3,
@@ -139,18 +145,9 @@ actor MCPServer {
             if let project = registered {
                 let slug = ForestStore.projectTagSlug(project.name)
                 let store = ForestStore(forestPath: Configuration.load().forestPath)
-                if let entries = try? store.entries() {
-                    var created = 0
-                    for entry in entries where entry.projectSlugs.contains(slug) {
-                        let title = nest.slug(forTitle: entry.title)
-                        let existed = FileManager.default.fileExists(
-                            atPath: nest.nestFolder.appendingPathComponent("\(title).md").path
-                        )
-                        if (try? nest.nest(entry: entry)) != nil, !existed { created += 1 }
-                    }
-                    if created > 0 {
-                        log("reconciled \(created) tagged entr\(created == 1 ? "y" : "ies") into nest")
-                    }
+                let created = nest.reconcile(taggedWith: slug, from: store)
+                if created > 0 {
+                    log("reconciled \(created) tagged entr\(created == 1 ? "y" : "ies") into nest")
                 }
             }
             // Rebuild INDEX.md on every session start so reconciled entries and any
@@ -238,8 +235,11 @@ actor MCPServer {
             toolFindInForest(id: id, arguments: arguments)
         case "nest_idea":
             toolNestIdea(id: id, arguments: arguments)
+        case "set_nest_state":
+            toolSetNestState(id: id, arguments: arguments)
         case "archive_nest":
-            toolArchiveNest(id: id, arguments: arguments)
+            // Back-compat alias: archiving == dropping.
+            toolSetNestState(id: id, arguments: arguments, forcedState: .dropped)
         case "refresh_nest_index":
             toolRefreshNestIndex(id: id, arguments: arguments)
         case "recent_ideas":
@@ -300,6 +300,8 @@ actor MCPServer {
             return
         }
         let resolved = resolveProject(explicit: arguments["project"] as? String)
+        let presetTitle = arguments["title"] as? String
+        let presetBullets = (arguments["bullets"] as? [Any])?.compactMap { $0 as? String } ?? []
         // nest defaults to true whenever we have a project context — the common case
         // is "stash this into the project I'm working in," and that should also
         // materialize a nest file so Claude Code sees it in this and future sessions.
@@ -316,13 +318,32 @@ actor MCPServer {
             claudeModel: config.claudeModel
         )
         do {
-            let outcome = try await service.capture(transcript: text, project: resolved?.name)
+            let outcome = try await service.capture(transcript: text, project: resolved?.name, presetTitle: presetTitle, presetBullets: presetBullets)
             switch outcome {
             case .empty:
                 sendToolResult(id: id, text: "Empty input — nothing stashed.")
             case .captured(let idea, let summarized):
+                // Materialize the nest file first so the result can lead with where
+                // the user actually cares it landed — the project nest — and the
+                // global-forest write reads as the durable backing, not the headline.
+                var nestedPath: String? = nil
+                var nestFailed = false
+                if let resolved, shouldNest {
+                    let store = ForestStore(forestPath: config.forestPath)
+                    if let entry = (try? store.entries())?.first(where: { $0.timestampString == ISO8601EncodedString(idea.createdAt) }),
+                       let url = try? nestStore(for: resolved).nest(entry: entry) {
+                        nestedPath = url.path
+                    } else {
+                        nestFailed = true
+                    }
+                }
                 var lines: [String] = []
-                lines.append("Stashed in \(config.forestPath).")
+                if let nestedPath, let resolved {
+                    lines.append("Added to the \(resolved.name) nest → \(nestedPath)")
+                    lines.append("Backed by the global forest (\(config.forestPath)).")
+                } else {
+                    lines.append("Stashed in \(config.forestPath).")
+                }
                 lines.append("Title: \(idea.title)")
                 if !idea.bullets.isEmpty {
                     lines.append("Bullets:")
@@ -330,23 +351,14 @@ actor MCPServer {
                 }
                 if let resolved {
                     lines.append("Tagged: #\(resolved.slug) (\(resolved.source))")
-                    if shouldNest {
-                        // Read the freshly-appended entry back out so the nest file
-                        // contains the same timestamp/title/bullets/raw as global.
-                        let store = ForestStore(forestPath: config.forestPath)
-                        if let entry = (try? store.entries())?.first(where: { $0.timestampString == ISO8601EncodedString(idea.createdAt) }) {
-                            let nest = nestStore(for: resolved)
-                            if let url = try? nest.nest(entry: entry) {
-                                lines.append("Nested at: \(url.path)")
-                            } else {
-                                lines.append("Note: stash succeeded but nest write failed.")
-                            }
-                        }
+                    if nestFailed {
+                        lines.append("Note: stash succeeded but nest write failed.")
                     }
                 } else {
                     lines.append("No project tag — cwd is too generic (home, /, or /tmp). Re-run with explicit `project`.")
                 }
-                lines.append(summarized ? "(summarized by Claude)" : "(raw)")
+                lines.append(summarized ? "(summarized by Claude)" : "(stored as-is, no summarization)")
+                lines.append("Tell the user in natural language that it's in the project's nest — don't name tools.")
                 sendToolResult(id: id, text: lines.joined(separator: "\n"))
             }
         } catch {
@@ -374,9 +386,18 @@ actor MCPServer {
 
         do {
             let entries = try store.entries().filter { entry in
-                guard entry.projectSlugs.isEmpty else { return false }
                 guard let ts = entry.timestamp, ts > sessionStart else { return false }
-                return true
+                // Untagged in-session captures always need triage.
+                if entry.projectSlugs.isEmpty { return true }
+                // A capture auto-tagged for THIS project at record time isn't
+                // "handled" until it's been materialized into the nest. The
+                // forest→nest reconcile only runs at session boot, so a capture
+                // tagged mid-session is stranded — tagged (so the old
+                // untagged-only filter skipped it) yet absent from the nest.
+                // Surface those, but skip ones already nested (no noise) and ones
+                // tagged for some other project (not ours to triage here).
+                guard entry.projectSlugs.contains(resolved.slug) else { return false }
+                return nest.locate(slug: nest.slug(forTitle: entry.title)) == nil
             }.prefix(limit)
 
             if entries.isEmpty {
@@ -387,7 +408,12 @@ actor MCPServer {
             blocks.append("\(entries.count) capture(s) during this session:\n")
             for (index, entry) in entries.enumerated() {
                 let ts = entry.timestampString ?? "?"
-                blocks.append("\(index + 1). \(entry.title)  (`\(ts)`)")
+                // Flag captures already tagged for this project so they read as
+                // "pull this into the nest" rather than "route this somewhere".
+                let tagNote = entry.projectSlugs.contains(resolved.slug)
+                    ? "  [already tagged for this project — not yet in the nest]"
+                    : ""
+                blocks.append("\(index + 1). \(entry.title)  (`\(ts)`)\(tagNote)")
                 for bullet in entry.bullets.prefix(3) {
                     blocks.append("   • \(bullet)")
                 }
@@ -495,22 +521,36 @@ actor MCPServer {
         }
     }
 
-    private func toolArchiveNest(id: Any?, arguments: [String: Any]) {
+    /// Move a nest item to a lifecycle state (open / deferred / done / dropped) by
+    /// rewriting its `status:` and letting the sweep relocate the file. `forcedState`
+    /// is used by the back-compat `archive_nest` alias (always dropped).
+    private func toolSetNestState(id: Any?, arguments: [String: Any], forcedState: NestState? = nil) {
         guard let slug = arguments["slug"] as? String, !slug.isEmpty else {
-            sendError(id: id, code: -32602, message: "archive_nest requires a 'slug' string (the filename without .md).")
+            sendError(id: id, code: -32602, message: "set_nest_state requires a 'slug' string (the filename without .md).")
             return
         }
+        let state: NestState
+        if let forcedState {
+            state = forcedState
+        } else {
+            guard let raw = arguments["state"] as? String, let parsed = NestState(rawValue: raw.lowercased()) else {
+                sendError(id: id, code: -32602, message: "set_nest_state requires a 'state' of open | deferred | done | dropped.")
+                return
+            }
+            state = parsed
+        }
         guard let resolved = resolveProject(explicit: arguments["project"] as? String) else {
-            sendError(id: id, code: -32602, message: "archive_nest: cwd too generic, pass `project` explicitly.")
+            sendError(id: id, code: -32602, message: "set_nest_state: cwd too generic, pass `project` explicitly.")
             return
         }
         let nest = nestStore(for: resolved)
         do {
-            let moved = try nest.archive(slug: slug)
-            if moved {
-                sendToolResult(id: id, text: "Archived \(slug).md → \(nest.archiveFolder.path)/\(slug).md")
+            let updated = try nest.setStatus(slug: slug, to: state)
+            if updated {
+                let dest = state == .open ? "open/" : "\(state.rawValue)/"
+                sendToolResult(id: id, text: "Set \(slug) → \(state.rawValue); file moved to \(dest) and digests updated.")
             } else {
-                sendToolResult(id: id, text: "No active nest file named \(slug).md.", isError: true)
+                sendToolResult(id: id, text: "No nest file named \(slug).md in any state folder.", isError: true)
             }
         } catch {
             sendToolResult(id: id, text: "Error: \(error.localizedDescription)", isError: true)
@@ -561,9 +601,23 @@ actor MCPServer {
         let config = Configuration.load()
         let store = ForestStore(forestPath: config.forestPath)
         do {
+            // Sync first: pull this project's tagged-but-unnested captures into the
+            // nest before triaging what's left. The MCP server persists across
+            // /clear, so its startup reconcile can be hours stale — doing it here
+            // means a deliberate scan always brings the nest current. Deliberate
+            // tags are honored automatically (no re-confirmation); only genuinely
+            // untagged ideas are surfaced below for the user to route.
+            var pulled = 0
+            if let resolved = resolveProject(explicit: arguments["project"] as? String) {
+                let nest = nestStore(for: resolved)
+                pulled = nest.reconcile(taggedWith: resolved.slug, from: store)
+            }
+            let pulledNote = pulled > 0
+                ? "Pulled \(pulled) capture\(pulled == 1 ? "" : "s") already tagged for this project into the nest.\n\n"
+                : ""
             let untagged = try store.entries().filter { $0.projectSlugs.isEmpty }.prefix(limit)
             if untagged.isEmpty {
-                sendToolResult(id: id, text: "No untagged ideas — every entry already carries a project tag.")
+                sendToolResult(id: id, text: "\(pulledNote)No untagged ideas — every entry already carries a project tag.")
                 return
             }
             var blocks: [String] = []
@@ -571,7 +625,7 @@ actor MCPServer {
                 let header = entry.timestampString.map { "[id: \($0)]" } ?? "[id: ?]"
                 blocks.append("\(header)\n## \(entry.title)\n\(entry.body)")
             }
-            sendToolResult(id: id, text: blocks.joined(separator: "\n\n"))
+            sendToolResult(id: id, text: pulledNote + blocks.joined(separator: "\n\n"))
         } catch {
             sendToolResult(id: id, text: "Error: \(error.localizedDescription)", isError: true)
         }
@@ -618,18 +672,35 @@ actor MCPServer {
             [
                 "name": "stash_idea",
                 "description": """
-                Capture a new idea into the user's global forest (~/forest.md). The text is \
-                summarized by Claude if configured. When `project` is set (or auto-resolved from \
-                the cwd), the entry is also nested into that project's .claude/nest/ so it becomes \
-                part of the project's loaded context. Use this to (a) record an idea mid-conversation, \
-                or (b) migrate items from an existing parking-lot/TODO file into squirrel by looping \
-                over them.
+                The single tool for creating a NEW item — use it whenever the user says \
+                "stash this", "add a nest item", "add this to the nest", "track this in the \
+                project", "note this for later", or similar. It appends the idea to the global \
+                ledger (~/forest.md) AND, when `project` is set or auto-resolved from the cwd, \
+                materializes it as a {slug}.md file in that project's .claude/nest/ so it loads \
+                into the project's context. This IS the correct way to add a fresh project-local \
+                nest item — do NOT hand-write files under .claude/nest/; this generates the slug, \
+                frontmatter, and index entry for you. The forest is the single source of truth; \
+                every nest item is projected from it. \
+                By default the text is summarized by Claude into a title + bullets. To skip that \
+                round-trip — the "quickly" case, or when you already have a clean title (e.g. \
+                migrating existing TODO lines) — pass `title` (and optional `bullets`) directly; \
+                the item is then stored verbatim with no LLM call. When reporting back, use \
+                natural language ("added it to the project's nest") — never name this tool.
                 """,
                 "inputSchema": [
                     "type": "object",
                     "required": ["text"],
                     "properties": [
-                        "text": ["type": "string", "description": "The idea text to stash."],
+                        "text": ["type": "string", "description": "The idea text / body to store (kept verbatim as the entry's raw transcript)."],
+                        "title": [
+                            "type": "string",
+                            "description": "Optional explicit title. When provided, summarization is skipped entirely (no LLM call) and the item is stored as-is — use this for the fast path or when you already have a clean one-line title."
+                        ],
+                        "bullets": [
+                            "type": "array",
+                            "items": ["type": "string"],
+                            "description": "Optional summary bullets to store alongside an explicit `title`. Ignored when `title` is absent (the summarizer produces its own bullets)."
+                        ],
                         "project": [
                             "type": "string",
                             "description": "Optional project name to tag and nest under. Defaults to the registered project matching the current cwd."
@@ -716,21 +787,25 @@ actor MCPServer {
                 ]
             ],
             [
-                "name": "archive_nest",
+                "name": "set_nest_state",
                 "description": """
-                Move a nest file from .claude/nest/{slug}.md to .claude/nest/archive/{slug}.md and \
-                remove it from INDEX. Use this only when an idea should be REMOVED from the \
-                project's always-loaded context (stale, irrelevant, no longer worth thinking about). \
-                For DONE items that you want to keep visible as historical record, set \
-                `status: resolved` in the file's frontmatter instead and call `refresh_nest_index` — \
-                resolved items stay in INDEX but sort below open/deferred. Global forest entry is \
-                untouched either way.
+                Move a nest item through its lifecycle by setting its state. The nest has four \
+                states, each a folder under .claude/nest/: `open` (the live queue — the ONLY one \
+                loaded into context via CLAUDE.md), `deferred` (parked for later, will revisit), \
+                `done` (completed), `dropped` (decided against — a tombstone, not a completion). \
+                Setting the state rewrites the file's `status:` and moves it into the matching \
+                folder, updating all digests. When you FINISH the work an item describes, call \
+                this with state `done` — that's how it leaves the open list. Use `dropped` for \
+                abandoned ideas, `deferred` to park, `open` to bring one back. The global forest \
+                entry is untouched. (Equivalent to editing the file's `status:` and calling \
+                refresh_nest_index — this is just the reliable one-shot.)
                 """,
                 "inputSchema": [
                     "type": "object",
-                    "required": ["slug"],
+                    "required": ["slug", "state"],
                     "properties": [
                         "slug": ["type": "string", "description": "The nest file's slug (filename without .md)."],
+                        "state": ["type": "string", "enum": ["open", "deferred", "done", "dropped"], "description": "Target lifecycle state."],
                         "project": ["type": "string", "description": "Project name. Defaults to cwd's registered project."]
                     ]
                 ]
@@ -738,13 +813,14 @@ actor MCPServer {
             [
                 "name": "refresh_nest_index",
                 "description": """
-                Regenerate the project's INDEX.md from the current contents of .claude/nest/. \
-                The INDEX lists each parked idea as a title + one-line summary (the summary \
-                defaults to the idea's first bullet, or its `summary:` frontmatter override). \
-                CALL THIS after editing the `priority:`, `status:`, or `summary:` frontmatter \
-                of any nest file, or after rewriting a title/first bullet, so the INDEX \
-                reflects the change. Auto-called on MCP startup, so between sessions you don't \
-                need it. Within a session, after you edit a nest file directly, call this once.
+                Regenerate the project's nest digests from the current contents of \
+                .claude/nest/. This SWEEPS every file into the folder matching its `status:` \
+                (open / deferred / done / dropped) and rebuilds each folder's digest — the \
+                top-level INDEX.md lists open items only (it's the one loaded via CLAUDE.md); \
+                done/, deferred/, and dropped/ get their own pull-only digests. CALL THIS after \
+                editing the `status:`, `priority:`, or `summary:` frontmatter of any nest file \
+                (or prefer `set_nest_state` to change status). Auto-called on MCP startup; \
+                within a session, call once after a direct edit.
                 """,
                 "inputSchema": [
                     "type": "object",
@@ -777,15 +853,18 @@ actor MCPServer {
             [
                 "name": "untagged_ideas",
                 "description": """
-                Return ALL untagged forest entries (across all of time). Rarely the right tool — \
-                for in-session captures use `session_captures`; for older captures matching a \
-                topic use `find_in_forest`. This one is the rare \"give me everything that's \
-                still un-routed\" view, e.g. for a manual audit.
+                Sync-then-triage for the current project. First pulls any captures already \
+                tagged for this project that aren't in the nest yet into the nest (a forest→nest \
+                reconcile — needed because the MCP server persists across /clear, so its \
+                startup reconcile can be stale), then returns ALL untagged forest entries \
+                (across all of time) for the user to route. The reconcile count, if any, is \
+                reported at the top of the result. This backs the scan-forest skill.
                 """,
                 "inputSchema": [
                     "type": "object",
                     "properties": [
-                        "limit": ["type": "integer", "description": "Max entries (default 30)."]
+                        "limit": ["type": "integer", "description": "Max entries (default 30)."],
+                        "project": ["type": "string", "description": "Project to reconcile into; defaults to the cwd's registered project."]
                     ]
                 ]
             ],

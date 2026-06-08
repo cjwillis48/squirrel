@@ -1,9 +1,44 @@
 import Foundation
 
+/// The lifecycle state of a nested idea. Each state is a subfolder under
+/// `.claude/nest/`, and a file physically lives in the folder matching its
+/// `status:` frontmatter. Only `open` is loaded into context (via the top-level
+/// INDEX.md that CLAUDE.md imports); the rest are pull-only records.
+///
+/// - open: on the plate now — the live working queue.
+/// - deferred: alive, but parked for later; expected to return to `open`.
+/// - done: completed.
+/// - dropped: decided against — a tombstone, not a completion.
+public enum NestState: String, CaseIterable, Sendable {
+    case open, deferred, done, dropped
+
+    /// Map a frontmatter `status:` value (including legacy vocabulary) to a state.
+    /// Legacy `resolved` → done, `archived` → dropped. Unknown / missing → open.
+    public init(status: String?) {
+        switch status?.lowercased() {
+        case "deferred": self = .deferred
+        case "done", "resolved", "completed": self = .done
+        case "dropped", "archived": self = .dropped
+        default: self = .open
+        }
+    }
+}
+
 /// Per-project working storage for forest ideas that have been pulled into a project
 /// (a "nest"). Lives under `<projectRoot>/.claude/nest/`. Once an idea is nested, its
 /// file is owned by the project — squirrel writes it on first nest, the user/Claude
 /// edit it freely afterward, and it is never synced back from global forest.md.
+///
+/// Layout (all under `.claude/nest/`):
+///   INDEX.md            digest of `open/` — the one file CLAUDE.md loads
+///   .gitignore          ignores everything but itself (the nest is personal)
+///   open/<slug>.md      live working queue
+///   deferred/<slug>.md  + deferred/INDEX.md
+///   done/<slug>.md      + done/INDEX.md
+///   dropped/<slug>.md   + dropped/INDEX.md
+///
+/// Changing a file's `status:` and refreshing moves it into the matching folder —
+/// the sweep in `regenerateIndex()` is self-healing in every direction.
 public struct NestStore: Sendable {
     public let projectRoot: String
 
@@ -21,12 +56,25 @@ public struct NestStore: Sendable {
         claudeFolder.appendingPathComponent("nest", isDirectory: true)
     }
 
-    public var archiveFolder: URL {
-        nestFolder.appendingPathComponent("archive", isDirectory: true)
+    /// The subfolder that holds files in `state`.
+    public func folder(for state: NestState) -> URL {
+        nestFolder.appendingPathComponent(state.rawValue, isDirectory: true)
     }
 
+    /// The digest for `state`. The `open` digest is hoisted to the top-level
+    /// `INDEX.md` (the stable path CLAUDE.md imports); the others live inside
+    /// their own folder.
+    public func digestFile(for state: NestState) -> URL {
+        state == .open ? indexFile : folder(for: state).appendingPathComponent("INDEX.md")
+    }
+
+    /// Top-level INDEX.md — the `open` digest, loaded into context via CLAUDE.md.
     public var indexFile: URL {
         nestFolder.appendingPathComponent("INDEX.md")
+    }
+
+    public var gitignoreFile: URL {
+        nestFolder.appendingPathComponent(".gitignore")
     }
 
     public var stateFile: URL {
@@ -44,12 +92,26 @@ public struct NestStore: Sendable {
         FileManager.default.fileExists(atPath: indexFile.path)
     }
 
-    /// Create the nest folder + empty INDEX.md if absent. Idempotent.
+    /// Create the nest folder, the `open/` subfolder, an empty top-level INDEX.md,
+    /// and (on first creation) a `.gitignore`. Idempotent.
     public func ensureInitialized() throws {
         let fm = FileManager.default
+        let folderExisted = fm.fileExists(atPath: nestFolder.path)
         try fm.createDirectory(at: nestFolder, withIntermediateDirectories: true)
+        try fm.createDirectory(at: folder(for: .open), withIntermediateDirectories: true)
         if !fm.fileExists(atPath: indexFile.path) {
-            try Self.emptyIndexBody.write(to: indexFile, atomically: true, encoding: .utf8)
+            try renderDigest(state: .open, items: []).write(to: indexFile, atomically: true, encoding: .utf8)
+        }
+        // Seed a .gitignore the first time we create the nest folder so the nest
+        // defaults to a personal, locally-regenerated parking lot rather than a
+        // checked-in backlog. INDEX.md and the slug files are regenerated on every
+        // session, so committing them just manufactures drift between git and the
+        // working tree. The `!.gitignore` line keeps the ignore file itself
+        // trackable so the intent is visible in the repo. Tying this to *first
+        // creation* (folder absent) means a user who deletes it to deliberately
+        // commit their nest isn't re-fought on every session.
+        if !folderExisted && !fm.fileExists(atPath: gitignoreFile.path) {
+            try Self.nestGitignoreBody.write(to: gitignoreFile, atomically: true, encoding: .utf8)
         }
     }
 
@@ -71,74 +133,206 @@ public struct NestStore: Sendable {
         try (existing + separator + snippet + "\n").write(to: claudeMdFile, atomically: true, encoding: .utf8)
     }
 
-    // MARK: - Nest / archive
+    // MARK: - Nest / state transitions
 
-    /// Write a nest file for `entry` if one does not already exist, and ensure the
-    /// INDEX reflects the current nest contents (grouped by priority). Returns the
-    /// file URL written or referenced.
+    /// Find the file for `slug` in whichever state folder (or legacy flat location)
+    /// it currently lives. Returns nil if no nest file exists for the slug.
+    public func locate(slug: String) -> URL? {
+        let fm = FileManager.default
+        let name = "\(slug).md"
+        for state in NestState.allCases {
+            let url = folder(for: state).appendingPathComponent(name)
+            if fm.fileExists(atPath: url.path) { return url }
+        }
+        let legacy = nestFolder.appendingPathComponent(name)
+        return fm.fileExists(atPath: legacy.path) ? legacy : nil
+    }
+
+    /// Write a nest file for `entry` if one does not already exist (in any state),
+    /// then regenerate. New captures land in `open/`. Returns the file URL.
     @discardableResult
     public func nest(entry: ForestEntry) throws -> URL {
         try ensureInitialized()
-        let slug = slug(forTitle: entry.title)
-        let file = nestFolder.appendingPathComponent("\(slug).md")
-
-        if !FileManager.default.fileExists(atPath: file.path) {
-            let body = renderNestFile(entry: entry, slug: slug)
-            try body.write(to: file, atomically: true, encoding: .utf8)
-        }
+        let (url, _) = try ensureNestFile(for: entry)
         try regenerateIndex()
-        return file
+        return url
     }
 
-    /// Move the named nest file into the archive subfolder and regenerate INDEX.
-    /// Returns true if a file was moved.
+    /// Create-only write: if a file for this slug already exists anywhere, return it
+    /// untouched; otherwise write a fresh `open/` file. Does NOT regenerate (callers
+    /// batch that). Returns the URL and whether it was newly created.
     @discardableResult
-    public func archive(slug: String) throws -> Bool {
-        let fm = FileManager.default
-        let source = nestFolder.appendingPathComponent("\(slug).md")
-        guard fm.fileExists(atPath: source.path) else { return false }
+    private func ensureNestFile(for entry: ForestEntry) throws -> (url: URL, created: Bool) {
+        let slug = slug(forTitle: entry.title)
+        if let existing = locate(slug: slug) { return (existing, false) }
+        try FileManager.default.createDirectory(at: folder(for: .open), withIntermediateDirectories: true)
+        let file = folder(for: .open).appendingPathComponent("\(slug).md")
+        try renderNestFile(entry: entry, slug: slug).write(to: file, atomically: true, encoding: .utf8)
+        return (file, true)
+    }
 
-        try fm.createDirectory(at: archiveFolder, withIntermediateDirectories: true)
-        let target = archiveFolder.appendingPathComponent("\(slug).md")
-        if fm.fileExists(atPath: target.path) {
-            try fm.removeItem(at: target)
+    /// Pull every forest entry tagged with `projectSlug` into the nest as an `open/`
+    /// file, skipping ones that already have a nest file in any state (create-only —
+    /// never clobbers an edited file, never resurrects a done/dropped item). Returns
+    /// the count of newly-written files. This is the forest→nest reconcile. It runs
+    /// on MCP startup, but the MCP server — and so that startup pass — persists across
+    /// `/clear`, so in a long-lived session it can be hours stale. It's therefore
+    /// also run on every deliberate pull (e.g. scan-forest) so captures tagged after
+    /// boot still land.
+    @discardableResult
+    public func reconcile(taggedWith projectSlug: String, from store: ForestStore) -> Int {
+        guard (try? ensureInitialized()) != nil, let entries = try? store.entries() else { return 0 }
+        var created = 0
+        for entry in entries where entry.projectSlugs.contains(projectSlug) {
+            if let result = try? ensureNestFile(for: entry), result.created { created += 1 }
         }
-        try fm.moveItem(at: source, to: target)
+        // Always regenerate: besides surfacing new files, this self-heals any
+        // status edits made since the last refresh (moving files to the right folder).
+        try? regenerateIndex()
+        return created
+    }
+
+    /// Set the lifecycle state of the nest file named `slug` by rewriting its
+    /// `status:` frontmatter, then regenerate — which sweeps the file into the
+    /// matching folder. Returns true if a file was found and updated.
+    @discardableResult
+    public func setStatus(slug: String, to state: NestState) throws -> Bool {
+        guard let url = locate(slug: slug) else { return false }
+        let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        try rewriteStatusLine(in: text, to: state).write(to: url, atomically: true, encoding: .utf8)
         try regenerateIndex()
         return true
     }
 
-    /// Rebuild INDEX.md from the current contents of the nest folder, grouped by
-    /// `priority:` frontmatter and ordered open → deferred → resolved within each
-    /// group. Call this after any direct edit to a nest file's frontmatter (or via
-    /// the `refresh_nest_index` MCP tool).
+    /// Rewrite the first `status:` line inside the frontmatter to `state`,
+    /// preserving the rest of the file. Inserts a frontmatter block / status line
+    /// if one is missing.
+    private func rewriteStatusLine(in text: String, to state: NestState) -> String {
+        let statusLine = "status: \(state.rawValue)   # one of: open | deferred | done | dropped"
+        var lines = text.components(separatedBy: "\n")
+        guard let open = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "---" }) else {
+            return "---\n\(statusLine)\n---\n\n" + text
+        }
+        var close: Int?
+        var i = open + 1
+        while i < lines.count {
+            if lines[i].trimmingCharacters(in: .whitespaces) == "---" { close = i; break }
+            i += 1
+        }
+        guard let closeIdx = close else {
+            return "---\n\(statusLine)\n---\n\n" + text
+        }
+        if let sIdx = (open + 1..<closeIdx).first(where: {
+            lines[$0].trimmingCharacters(in: .whitespaces).hasPrefix("status:")
+        }) {
+            lines[sIdx] = statusLine
+        } else {
+            lines.insert(statusLine, at: open + 1)
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: - Index regeneration (sweep + digests)
+
+    private struct DigestItem {
+        var slug: String
+        var title: String
+        var summary: String?
+        var priority: String?
+    }
+
+    /// Sweep every nest file into the folder matching its `status:`, then rebuild a
+    /// digest for each state. This is the self-healing core: edit a file's status
+    /// (or drop a legacy flat file in), refresh, and everything lands where it
+    /// belongs with up-to-date indexes. Called after any change and on the
+    /// `refresh_nest_index` MCP tool / MCP startup.
     public func regenerateIndex() throws {
         try ensureInitialized()
         let fm = FileManager.default
-        let contents = try fm.contentsOfDirectory(at: nestFolder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
 
-        struct Item {
-            var slug: String
-            var title: String
-            var summary: String?
-            var priority: String?
-            var status: String
+        // 1. Gather candidate files: legacy flat files at nest/ top level (pre-folder
+        //    layout — this migrates them) plus everything already in a state folder.
+        var candidates: [URL] = []
+        if let top = try? fm.contentsOfDirectory(at: nestFolder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+            candidates += top.filter { $0.pathExtension == "md" && $0.lastPathComponent != "INDEX.md" }
+        }
+        for state in NestState.allCases {
+            if let urls = try? fm.contentsOfDirectory(at: folder(for: state), includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+                candidates += urls.filter { $0.pathExtension == "md" && $0.lastPathComponent != "INDEX.md" }
+            }
         }
 
-        var items: [Item] = []
-        for url in contents {
-            guard url.pathExtension == "md", url.lastPathComponent != "INDEX.md" else { continue }
+        // 1b. Legacy migration: the previous design moved "archived" files into
+        //     nest/archive/. Those are abandoned items → dropped. Force their status
+        //     to dropped (they may still read open/resolved from before) so the sweep
+        //     routes them to dropped/ instead of resurrecting them into open/.
+        let legacyArchive = nestFolder.appendingPathComponent("archive", isDirectory: true)
+        if let urls = try? fm.contentsOfDirectory(at: legacyArchive, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+            for url in urls where url.pathExtension == "md" && url.lastPathComponent != "INDEX.md" {
+                let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+                try? rewriteStatusLine(in: text, to: .dropped).write(to: url, atomically: true, encoding: .utf8)
+                candidates.append(url)
+            }
+        }
+
+        // 2. Move any file that isn't in the folder its status dictates.
+        for url in candidates {
+            let desired = NestState(status: readFrontmatter(from: url).status)
+            let target = folder(for: desired).appendingPathComponent(url.lastPathComponent)
+            if url.standardizedFileURL == target.standardizedFileURL { continue }
+            try fm.createDirectory(at: folder(for: desired), withIntermediateDirectories: true)
+            if fm.fileExists(atPath: target.path) { try? fm.removeItem(at: target) }
+            try fm.moveItem(at: url, to: target)
+        }
+
+        // 2b. Remove the now-empty legacy archive/ folder (only if truly empty).
+        if let remaining = try? fm.contentsOfDirectory(at: legacyArchive, includingPropertiesForKeys: nil), remaining.isEmpty {
+            try? fm.removeItem(at: legacyArchive)
+        }
+
+        // 3. Rebuild each state's digest from its (now-correct) contents.
+        for state in NestState.allCases {
+            try writeDigest(for: state)
+        }
+    }
+
+    /// Build the digest for one state from the files now in its folder. The `open`
+    /// digest (top-level INDEX.md) is always written so the CLAUDE.md @-import never
+    /// dangles; the others are written only when their folder is non-empty and
+    /// removed when it empties out, so stale digests don't linger.
+    private func writeDigest(for state: NestState) throws {
+        let fm = FileManager.default
+        let dir = folder(for: state)
+        let urls = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+        var items: [DigestItem] = []
+        for url in urls where url.pathExtension == "md" && url.lastPathComponent != "INDEX.md" {
             let slug = url.deletingPathExtension().lastPathComponent
-            let fm = readFrontmatter(from: url)
+            let f = readFrontmatter(from: url)
             let (title, firstBullet) = titleAndFirstBullet(from: url, slug: slug)
             // Frontmatter `summary:` is an explicit override; otherwise lead with the
-            // first bullet so the index reads as a one-line gloss of the idea.
-            let summary = fm.summary ?? firstBullet
-            items.append(Item(slug: slug, title: title, summary: summary, priority: fm.priority, status: fm.status ?? "open"))
+            // first bullet so the digest reads as a one-line gloss of the idea.
+            items.append(DigestItem(slug: slug, title: title, summary: f.summary ?? firstBullet, priority: f.priority))
         }
 
-        // Group by priority. Sort priorities so P-numbers go in numeric order,
-        // anything else sorts alphabetically, no-priority lands last.
+        let digest = digestFile(for: state)
+        if state != .open && items.isEmpty {
+            // Folder emptied out: drop its digest, and the folder too if nothing
+            // else remains, so the nest doesn't accumulate stale dirs. (The sweep
+            // re-creates the folder before moving a file in, so this is safe.) Only
+            // remove the dir when truly empty — never recursively.
+            if fm.fileExists(atPath: digest.path) { try? fm.removeItem(at: digest) }
+            let remaining = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+            if remaining.isEmpty { try? fm.removeItem(at: dir) }
+            return
+        }
+        try renderDigest(state: state, items: items).write(to: digest, atomically: true, encoding: .utf8)
+    }
+
+    /// Render a digest: header + items grouped by priority. Each bullet carries the
+    /// `(state/slug)` path so a reader can jump straight to the file.
+    private func renderDigest(state: NestState, items: [DigestItem]) -> String {
+        var lines = headerLines(for: state)
+
         let grouped = Dictionary(grouping: items, by: { $0.priority ?? "" })
         let orderedKeys: [String] = grouped.keys.sorted { a, b in
             switch (a.isEmpty, b.isEmpty) {
@@ -152,45 +346,67 @@ public struct NestStore: Sendable {
             return a.localizedCaseInsensitiveCompare(b) == .orderedAscending
         }
 
-        var lines: [String] = []
-        lines.append(contentsOf: Self.indexHeaderLines)
-
         for key in orderedKeys {
-            let heading = key.isEmpty ? "## (no priority)" : "## \(key)"
-            lines.append(heading)
-            // Within a priority bucket: open first, deferred next, resolved last.
-            let bucket = (grouped[key] ?? []).sorted { lhs, rhs in
-                statusRank(lhs.status) < statusRank(rhs.status) ||
-                (statusRank(lhs.status) == statusRank(rhs.status) && lhs.slug < rhs.slug)
-            }
-            for item in bucket {
-                lines.append(indexLine(for: item.slug, title: item.title, summary: item.summary, status: item.status))
+            lines.append(key.isEmpty ? "## (no priority)" : "## \(key)")
+            for item in (grouped[key] ?? []).sorted(by: { $0.slug < $1.slug }) {
+                lines.append(indexLine(ref: "\(state.rawValue)/\(item.slug)", title: item.title, summary: item.summary))
             }
             lines.append("")
         }
-
-        try lines.joined(separator: "\n").write(to: indexFile, atomically: true, encoding: .utf8)
+        return lines.joined(separator: "\n") + "\n"
     }
 
-    /// Render one INDEX bullet: `- **Title** — summary (slug) <!-- status -->`.
-    /// The bare slug is kept so a reader (or the user) can jump straight to
-    /// `.claude/nest/<slug>.md` for the full entry without guessing the filename.
-    private func indexLine(for slug: String, title: String, summary: String?, status: String) -> String {
+    /// Render one digest bullet: `- **Title** — summary `(state/slug)``.
+    private func indexLine(ref: String, title: String, summary: String?) -> String {
         var line = "- **\(title)**"
         if let summary, !summary.isEmpty {
             line += " — \(clampSummary(summary))"
         }
-        line += " `(\(slug))`"
-        switch status.lowercased() {
-        case "open": break
-        case "deferred": line += "  <!-- deferred -->"
-        case "resolved": line += "  <!-- resolved -->"
-        default: line += "  <!-- \(status) -->"
-        }
+        line += " `(\(ref))`"
         return line
     }
 
-    /// Trim a summary to a single tidy line for the index (the full text lives in the
+    /// Per-state digest header. Only `open` is loaded into context.
+    private func headerLines(for state: NestState) -> [String] {
+        switch state {
+        case .open:
+            return [
+                "# Squirrel nest — open",
+                "",
+                "Auto-managed by squirrel-mcp. Open items for this project — title, a one-line",
+                "summary, and the `(open/slug)` path of the file under `.claude/nest/open/`. This",
+                "is the only digest loaded via CLAUDE.md. Lifecycle: set a file's `status:` to",
+                "done / deferred / dropped and it moves to that folder on the next refresh.",
+                ""
+            ]
+        case .deferred:
+            return [
+                "# Squirrel nest — deferred",
+                "",
+                "Parked for later (not loaded into context). Set `status: open` in a file to",
+                "bring it back into the open list.",
+                ""
+            ]
+        case .done:
+            return [
+                "# Squirrel nest — done",
+                "",
+                "Completed items for this project (a record, not loaded into context). Set",
+                "`status: open` in a file to reopen it.",
+                ""
+            ]
+        case .dropped:
+            return [
+                "# Squirrel nest — dropped",
+                "",
+                "Decided against — kept as a record (not loaded into context). Not the same as",
+                "done: these were abandoned, not finished.",
+                ""
+            ]
+        }
+    }
+
+    /// Trim a summary to a single tidy line for the digest (the full text lives in the
     /// idea file). Collapses internal newlines and clamps to a word boundary.
     private func clampSummary(_ raw: String, maxWords: Int = 18) -> String {
         let oneLine = raw.split(whereSeparator: { $0 == "\n" || $0 == "\r" })
@@ -294,20 +510,11 @@ public struct NestStore: Sendable {
         return Int(lowered.dropFirst())
     }
 
-    private func statusRank(_ status: String) -> Int {
-        switch status.lowercased() {
-        case "open": return 0
-        case "deferred": return 1
-        case "resolved": return 2
-        default: return 3
-        }
-    }
-
     // MARK: - Session-start timestamp
     //
     // Written by `squirrel-mcp` on startup to mark when the current Claude Code
-    // session began. `session-check` and `session_captures` both read this as
-    // the cutoff for "captured during this session."
+    // session began. `session_captures` reads this as the cutoff for "captured
+    // during this session."
 
     public func sessionStartTs() -> Date? {
         guard let data = try? Data(contentsOf: stateFile),
@@ -334,9 +541,9 @@ public struct NestStore: Sendable {
     // MARK: - One-shot nudges
     //
     // Each in-session capture gets at most one prompt-time nudge per session:
-    // the hook surfaces it once, the model acks it, and subsequent prompts no
-    // longer carry the same reminder. Persistence lives in `squirrel-state.json`
-    // alongside `session_start_ts`; the set is cleared on every MCP startup.
+    // the model surfaces it once, acks it, and subsequent prompts no longer carry
+    // the same reminder. Persistence lives in `squirrel-state.json` alongside
+    // `session_start_ts`; the set is cleared on every MCP startup.
 
     public func nudgedCaptureIDs() -> Set<String> {
         guard let data = try? Data(contentsOf: stateFile),
@@ -363,10 +570,6 @@ public struct NestStore: Sendable {
     // MARK: - Slug
 
     /// Generate a kebab-case slug from a title, capped at `maxWords` and ASCII-safe.
-    /// Collision handling (appending a timestamp suffix) is applied if a file already
-    /// exists for the base slug AND that file's `captured:` frontmatter differs from
-    /// the caller's intent — i.e., we only suffix when this is genuinely a different
-    /// idea sharing a similar title.
     public func slug(forTitle title: String, maxWords: Int = 4) -> String {
         let normalized = title.lowercased()
         var words: [String] = []
@@ -389,18 +592,16 @@ public struct NestStore: Sendable {
 
     // MARK: - Internals
 
-    /// Header lines shared by the empty index and every regeneration. Kept as a
-    /// single source so the prose can't drift between the two write paths.
-    static let indexHeaderLines: [String] = [
-        "# Squirrel nest",
-        "",
-        "Auto-managed by squirrel-mcp. Parked ideas for this project — title, a one-line",
-        "summary, and the `(slug)` of the file under `.claude/nest/` that holds the full",
-        "detail. This index is loaded via CLAUDE.md; open a slug's file only when you act on it.",
-        ""
-    ]
-
-    private static let emptyIndexBody = indexHeaderLines.joined(separator: "\n") + "\n"
+    /// Seeded into `.claude/nest/.gitignore` on first nest creation. Ignores the
+    /// regenerated digests and all slug files while keeping the ignore file itself
+    /// trackable, so a fresh clone can see the nest is personal by design.
+    static let nestGitignoreBody = """
+    # Squirrel nest: a personal "don't forget this while I'm in here" parking lot,
+    # regenerated locally every session — not a shared backlog. Ignored on purpose.
+    # Delete this file if you'd rather commit the nest as a shared project backlog.
+    *
+    !.gitignore
+    """ + "\n"
 
     private func renderNestFile(entry: ForestEntry, slug: String) -> String {
         let ts = entry.timestampString ?? ISO8601DateFormatter().string(from: Date())
@@ -408,9 +609,9 @@ public struct NestStore: Sendable {
         lines.append("---")
         lines.append("captured: \(ts)")
         lines.append("slug: \(slug)")
-        lines.append("status: open   # one of: open | deferred | resolved | archived")
+        lines.append("status: open   # one of: open | deferred | done | dropped")
         lines.append("# priority: P0   # optional, freeform — e.g. P0/P1/P2, high/medium/low, now/next/later")
-        lines.append("# summary:    # optional one-liner for INDEX.md; defaults to the first bullet below")
+        lines.append("# summary:    # optional one-liner for the digest; defaults to the first bullet below")
         lines.append("---")
         lines.append("")
         lines.append("# \(entry.title)")

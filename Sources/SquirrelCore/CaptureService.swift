@@ -25,7 +25,7 @@ public struct CaptureService: Sendable {
         case empty
     }
 
-    public func capture(transcript: String, durationSeconds: Double = 0, project: String? = nil) async throws -> CaptureOutcome {
+    public func capture(transcript: String, durationSeconds: Double = 0, project: String? = nil, presetTitle: String? = nil, presetBullets: [String] = []) async throws -> CaptureOutcome {
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .empty }
         if Self.looksLikeWhisperHallucination(trimmed) { return .empty }
@@ -37,7 +37,15 @@ public struct CaptureService: Sendable {
         // summarizer detect an explicitly-mentioned project (high precision only).
         var resolvedProject = project
 
-        if summarizeWithClaude, let key = anthropicKey, !key.isEmpty {
+        let explicitTitle = presetTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let explicitTitle, !explicitTitle.isEmpty {
+            // Caller already has a clean title (e.g. Claude authoring a nest item
+            // in-session, or migrating existing TODO lines) — store it as-is and
+            // skip the summarizer round-trip entirely. This is the "quickly" path:
+            // no LLM call, no project detection (the caller owns `project`).
+            title = Self.clampTitle(explicitTitle)
+            bullets = presetBullets
+        } else if summarizeWithClaude, let key = anthropicKey, !key.isEmpty {
             let anthropic = AnthropicService(apiKey: key, model: claudeModel)
             // Only ask the model to detect a project when the caller didn't supply
             // one. Pass the registered names so it can only pick a real project.
